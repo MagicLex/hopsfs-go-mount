@@ -99,6 +99,14 @@ func main() {
 	}
 	hopsfsmount.InitStagingFileCache()
 
+	if hopsfsmount.ControlSocket != "" {
+		l, err := hopsfsmount.ServeControlSocket(fileSystem, hopsfsmount.ControlSocket)
+		if err != nil {
+			logger.Fatal(fmt.Sprintf("Failed to listen on control socket %s: %v", hopsfsmount.ControlSocket, err), nil)
+		}
+		defer l.Close()
+	}
+
 	defer func() {
 		if hopsfsmount.StagingCache != nil {
 			hopsfsmount.StagingCache.Shutdown()
@@ -112,8 +120,12 @@ func main() {
 	go func() {
 		for x := range sigs {
 			//Handling INT/TERM signals - trying to gracefully unmount and exit
-			//TODO: before doing that we need to finish deferred flushes
 			logger.Info(fmt.Sprintf("Received signal: %s", x.String()), nil)
+			if fileSystem.WB != nil {
+				// Writes fenced, open files queued, uploads drained within stopDrainTimeout;
+				// what did not land is logged at ERROR with its path.
+				fileSystem.WB.Stop(hopsfsmount.StopDrainTimeout)
+			}
 			if hopsfsmount.StagingCache != nil {
 				hopsfsmount.StagingCache.Shutdown()
 			}

@@ -42,6 +42,9 @@ func (fh *FileHandle) dataChanged() bool {
 
 // Lock order: dataMutex (3) → fileHandleMutex (1) via upgradeHandleForWriting
 func (fh *FileHandle) Truncate(size int64) error {
+	if wb := fh.File.FileSystem.WB; wb != nil && wb.isFenced() {
+		return syscall.EROFS
+	}
 	fh.File.lockData()
 	defer fh.File.unlockData()
 
@@ -103,6 +106,14 @@ func (fh *FileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fus
 // Responds to FUSE Write request
 // Lock order: dataMutex (3) → fileHandleMutex (1) via upgradeHandleForWriting
 func (fh *FileHandle) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
+	if wb := fh.File.FileSystem.WB; wb != nil {
+		if wb.isFenced() {
+			return syscall.EROFS
+		}
+		if err := wb.takeError(fh.File.AbsolutePath()); err != nil {
+			return err
+		}
+	}
 	fh.File.lockData()
 	defer fh.File.unlockData()
 
@@ -141,6 +152,9 @@ func (fh *FileHandle) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 // Responds to the FUSE Fsync request
 // Lock order: dataMutex (3) → fileHandleMutex (1) via flushToDFS
 func (fh *FileHandle) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
+	if fh.File.FileSystem.WB != nil {
+		return fh.File.fsyncWriteBehind()
+	}
 	// If delaySyncUntilClose is enabled, skip fsync until file close
 	if fh.File.FileSystem.DelaySyncUntilClose {
 		logger.Debug("Fsync deferred until close", fh.logInfo(logger.Fields{Operation: Fsync}))
