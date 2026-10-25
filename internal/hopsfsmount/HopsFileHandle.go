@@ -44,16 +44,17 @@ func (fh *FileHandle) dataChanged() bool {
 func (fh *FileHandle) Truncate(size int64) error {
 	fh.File.lockData()
 	defer fh.File.unlockData()
+
+	// as an optimization the file is initially opened in readonly mode. The upgrade only loads
+	// the content, and sets the base admit registers.
+	err := fh.File.upgradeHandleForWriting(fh, Truncate)
+	if err != nil {
+		return err
+	}
 	if wb := fh.File.FileSystem.WB; wb != nil {
 		if err := wb.admit(fh.File); err != nil {
 			return err
 		}
-	}
-
-	// as an optimization the file is initially opened in readonly mode
-	err := fh.File.upgradeHandleForWriting(fh, Truncate)
-	if err != nil {
-		return err
 	}
 
 	sizeChanged, err := fh.File.fileProxy.Truncate(size)
@@ -115,14 +116,17 @@ func (fh *FileHandle) Write(ctx context.Context, req *fuse.WriteRequest, resp *f
 	}
 	fh.File.lockData()
 	defer fh.File.unlockData()
+
+	// as an optimization the file is initially opened in readonly mode. The upgrade only loads
+	// the content, and sets the base admit registers.
+	if err := fh.File.upgradeHandleForWriting(fh, Write); err != nil {
+		return err
+	}
 	if wb := fh.File.FileSystem.WB; wb != nil {
 		if err := wb.admit(fh.File); err != nil {
 			return err
 		}
 	}
-
-	// as an optimization the file is initially opened in readonly mode
-	fh.File.upgradeHandleForWriting(fh, Write)
 
 	nw, err := fh.File.fileProxy.WriteAt(req.Data, req.Offset)
 	resp.Size = nw
