@@ -137,8 +137,9 @@ func main() {
 			if fileSystem.WB != nil {
 				// A lazy unmount keeps serving while a process holds a file open, so Serve would
 				// not return; with the writes fenced and the uploads drained there is nothing left
-				// to serve. The exit code says whether every upload landed.
-				c.Close()
+				// to serve. Conn.Close would wait on the blocked request reader: the exit closes
+				// /dev/fuse and the kernel ends the connection. The exit code says whether every
+				// upload landed.
 				if len(unresolved) > 0 {
 					os.Exit(1)
 				}
