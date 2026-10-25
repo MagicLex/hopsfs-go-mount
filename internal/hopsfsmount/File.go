@@ -167,7 +167,7 @@ func (file *FileINode) RemoveHandle(handle *FileHandle) {
 // flushToDFS() (called from Flush) before Release/closeStaging runs.
 func (file *FileINode) closeStaging() {
 	// A file write-behind has not landed keeps its staged copy: the upload reads it.
-	if wb := file.FileSystem.WB; wb != nil && wb.pending(file.AbsolutePath()) {
+	if wb := file.FileSystem.WB; wb != nil && wb.retain(file.AbsolutePath(), file.isDirty) {
 		return
 	}
 	if file.fileProxy != nil { // if not already closed
@@ -199,9 +199,6 @@ func (file *FileINode) closeStaging() {
 // Must be called with dataMutex held
 func (file *FileINode) markDirty() {
 	file.isDirty = true
-	if wb := file.FileSystem.WB; wb != nil {
-		wb.written(file)
-	}
 }
 
 // Flushes file to DFS if dirty
@@ -431,6 +428,11 @@ func (file *FileINode) Setattr(ctx context.Context, req *fuse.SetattrRequest, re
 			return syscall.EROFS
 		}
 		if req.Valid.Mode() || req.Valid.Uid() || req.Valid.Gid() {
+			// HopsFS changes what it has: queue content written and not closed (a new file's
+			// first upload creates it), then wait for it.
+			if err := file.queueIfDirty(); err != nil {
+				return err
+			}
 			if err := wb.settle(file.AbsolutePath()); err != nil {
 				return err
 			}

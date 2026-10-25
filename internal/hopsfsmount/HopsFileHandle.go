@@ -42,11 +42,13 @@ func (fh *FileHandle) dataChanged() bool {
 
 // Lock order: dataMutex (3) → fileHandleMutex (1) via upgradeHandleForWriting
 func (fh *FileHandle) Truncate(size int64) error {
-	if wb := fh.File.FileSystem.WB; wb != nil && wb.isFenced() {
-		return syscall.EROFS
-	}
 	fh.File.lockData()
 	defer fh.File.unlockData()
+	if wb := fh.File.FileSystem.WB; wb != nil {
+		if err := wb.admit(fh.File); err != nil {
+			return err
+		}
+	}
 
 	// as an optimization the file is initially opened in readonly mode
 	err := fh.File.upgradeHandleForWriting(fh, Truncate)
@@ -107,15 +109,17 @@ func (fh *FileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fus
 // Lock order: dataMutex (3) → fileHandleMutex (1) via upgradeHandleForWriting
 func (fh *FileHandle) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
 	if wb := fh.File.FileSystem.WB; wb != nil {
-		if wb.isFenced() {
-			return syscall.EROFS
-		}
 		if err := wb.takeError(fh.File.AbsolutePath()); err != nil {
 			return err
 		}
 	}
 	fh.File.lockData()
 	defer fh.File.unlockData()
+	if wb := fh.File.FileSystem.WB; wb != nil {
+		if err := wb.admit(fh.File); err != nil {
+			return err
+		}
+	}
 
 	// as an optimization the file is initially opened in readonly mode
 	fh.File.upgradeHandleForWriting(fh, Write)

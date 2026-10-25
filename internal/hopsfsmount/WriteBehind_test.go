@@ -462,3 +462,63 @@ func TestWriteBehindControlSocketDrain(t *testing.T) {
 		assert.Equal(t, "c", e.readRemote("c.txt"))
 	})
 }
+
+// A write that reached the mount while an upload held its file, then a stop: the write is either
+// refused or its bytes are on HopsFS (or named unresolved) after the stop; never accepted and lost.
+func TestWriteBehindStopDuringUploadNeverLosesAnAcceptedWrite(t *testing.T) {
+	withWriteBehind(t, func(e *wbEnv) {
+		first, err := os.Create(e.local("w.txt"))
+		require.NoError(t, err)
+		second, err := os.OpenFile(e.local("w.txt"), os.O_RDWR, 0)
+		require.NoError(t, err)
+		defer second.Close()
+		_, err = first.WriteString("A")
+		require.NoError(t, err)
+		reached, release := e.hold("before-publish", "w.txt")
+		require.NoError(t, first.Close()) // queues the upload, which holds the file
+		waitFor(t, reached)
+
+		wrote := make(chan error, 1)
+		go func() { _, err := second.WriteAt([]byte("B"), 1); wrote <- err }()
+		time.Sleep(300 * time.Millisecond) // the write waits inside the mount for the file
+		type stopResult struct {
+			out      []Unresolved
+			timedOut bool
+		}
+		stopped := make(chan stopResult, 1)
+		go func() { out, timedOut := e.fs.WB.Stop(60 * time.Second); stopped <- stopResult{out, timedOut} }()
+		time.Sleep(300 * time.Millisecond)
+		release()
+
+		werr := <-wrote
+		stop := <-stopped
+		content := e.readRemote("w.txt")
+		if werr != nil {
+			assert.True(t, errors.Is(werr, syscall.EROFS), "%v", werr)
+			assert.Equal(t, "A", content)
+			return
+		}
+		named := false
+		for _, u := range stop.out {
+			named = named || u.Path == e.remote("w.txt")
+		}
+		assert.True(t, content == "AB" || named, "an accepted write is on HopsFS or named: content %q, stop %+v", content, stop)
+	})
+}
+
+func TestWriteBehindChmodOfAnOpenNewFile(t *testing.T) {
+	withWriteBehind(t, func(e *wbEnv) {
+		f, err := os.Create(e.local("m.txt"))
+		require.NoError(t, err)
+		defer f.Close() // a failure must not leave the mount busy at unmount
+		_, err = f.WriteString("x")
+		require.NoError(t, err)
+		require.NoError(t, f.Chmod(0600))
+		require.NoError(t, f.Close())
+		assert.Empty(t, e.drain())
+		fi, err := e.ext.Stat(e.remote("m.txt"))
+		require.NoError(t, err)
+		assert.Equal(t, os.FileMode(0600), fi.Mode().Perm())
+		assert.Equal(t, "x", e.readRemote("m.txt"))
+	})
+}

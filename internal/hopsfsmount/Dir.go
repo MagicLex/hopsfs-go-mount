@@ -260,11 +260,22 @@ func (dir *DirINode) Create(ctx context.Context, req *fuse.CreateRequest, resp *
 		// Write-behind: HopsFS gets the file at its first upload; until then its attributes are local.
 		now := dir.FileSystem.Clock.Now()
 		file.Attrs.Mtime, file.Attrs.Ctime = now, now
-		file.loadedBase = nil
-		wb.created(file)
 		file.lockData()
-		file.isDirty = true // an empty file is uploaded at close too
+		file.loadedBase = nil
+		err := wb.created(file)
+		if err == nil {
+			file.isDirty = true // an empty file is uploaded at close too
+		}
 		file.unlockData()
+		if err != nil {
+			// Fenced by a stop since the check above: nothing of this file was let in.
+			file.RemoveHandle(handle)
+			if StagingCache != nil {
+				StagingCache.Remove(targetPath)
+			}
+			dir.removeChildInode(Create, req.Name)
+			return nil, nil, err
+		}
 		return file, handle, nil
 	}
 
