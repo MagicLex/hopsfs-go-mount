@@ -121,10 +121,11 @@ func main() {
 		for x := range sigs {
 			//Handling INT/TERM signals - trying to gracefully unmount and exit
 			logger.Info(fmt.Sprintf("Received signal: %s", x.String()), nil)
+			var unresolved []hopsfsmount.Unresolved
 			if fileSystem.WB != nil {
 				// Writes fenced, open files queued, uploads drained within stopDrainTimeout;
 				// what did not land is logged at ERROR with its path.
-				fileSystem.WB.Stop(hopsfsmount.StopDrainTimeout)
+				unresolved, _ = fileSystem.WB.Stop(hopsfsmount.StopDrainTimeout)
 			}
 			if hopsfsmount.StagingCache != nil {
 				hopsfsmount.StagingCache.Shutdown()
@@ -133,6 +134,16 @@ func main() {
 			// Also reseting retry policy properties to stop useless retries
 			retryPolicy.MaxAttempts = 0
 			retryPolicy.MaxDelay = 0
+			if fileSystem.WB != nil {
+				// A lazy unmount keeps serving while a process holds a file open, so Serve would
+				// not return; with the writes fenced and the uploads drained there is nothing left
+				// to serve. The exit code says whether every upload landed.
+				c.Close()
+				if len(unresolved) > 0 {
+					os.Exit(1)
+				}
+				os.Exit(0)
+			}
 		}
 	}()
 	err = fs.Serve(c, fileSystem)
