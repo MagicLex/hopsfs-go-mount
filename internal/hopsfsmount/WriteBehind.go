@@ -111,28 +111,55 @@ func isWBTemp(name string) bool {
 	return strings.HasPrefix(name, ".") && strings.Contains(name, ".hopsfs-")
 }
 
-// Registers a file created through this mount: HopsFS does not have it until its first upload.
-func (wb *WriteBehind) created(file *FileINode) {
+// Registers a file created through this mount (HopsFS does not have it until its first
+// upload), unless writes are fenced. Caller holds file.dataMutex.
+func (wb *WriteBehind) created(file *FileINode) error {
 	wb.mu.Lock()
 	defer wb.mu.Unlock()
+	if wb.fenced {
+		return syscall.EROFS
+	}
 	p := file.AbsolutePath()
 	wb.entries[p] = &wbEntry{path: p, file: file, state: wbLocal}
+	return nil
 }
 
-// Marks file written. Caller holds file.dataMutex.
-func (wb *WriteBehind) written(file *FileINode) {
+// Admits a change to file's content: refused once writes are fenced, else the file is registered
+// before it changes, so a stop's snapshot holds every change it let in. Caller holds file.dataMutex.
+func (wb *WriteBehind) admit(file *FileINode) error {
 	wb.mu.Lock()
 	defer wb.mu.Unlock()
+	if wb.fenced {
+		return syscall.EROFS
+	}
 	p := file.AbsolutePath()
 	if _, ok := wb.entries[p]; !ok {
 		wb.entries[p] = &wbEntry{path: p, file: file, state: wbLocal, base: file.loadedBase, landed: 1, staged: 1}
 	}
+	return nil
 }
 
 func (wb *WriteBehind) isFenced() bool {
 	wb.mu.Lock()
 	defer wb.mu.Unlock()
 	return wb.fenced
+}
+
+// Whether p's staged copy must stay because something of it is not on HopsFS. A registered entry
+// with nothing pending (a change admitted that never happened) is dropped. Callers closing the
+// last handle hold the file's dataMutex, which guards dirty.
+func (wb *WriteBehind) retain(p string, dirty bool) bool {
+	wb.mu.Lock()
+	defer wb.mu.Unlock()
+	e, ok := wb.entries[p]
+	if !ok {
+		return false
+	}
+	if !dirty && e.state == wbLocal && e.landed == e.staged && e.landed > 0 {
+		delete(wb.entries, p)
+		return false
+	}
+	return true
 }
 
 func (wb *WriteBehind) pending(p string) bool {
@@ -146,6 +173,10 @@ func (wb *WriteBehind) pending(p string) bool {
 // WriteBehindWait for room; past it the entry is failed with the bytes kept staged.
 // Caller holds file.dataMutex.
 func (wb *WriteBehind) enqueue(file *FileINode, size int64) (uint64, error) {
+	return wb.enqueueBy(file, size, time.Now().Add(WriteBehindWait))
+}
+
+func (wb *WriteBehind) enqueueBy(file *FileINode, size int64, deadline time.Time) (uint64, error) {
 	wb.mu.Lock()
 	defer wb.mu.Unlock()
 	p := file.AbsolutePath()
@@ -154,7 +185,6 @@ func (wb *WriteBehind) enqueue(file *FileINode, size int64) (uint64, error) {
 		e = &wbEntry{path: p, file: file, base: file.loadedBase, landed: 1, staged: 1}
 		wb.entries[p] = e
 	}
-	deadline := time.Now().Add(WriteBehindWait)
 	for !e.counted && (wb.files+1 > WriteBehindMaxFiles || wb.bytes+size > WriteBehindMaxBytes) {
 		if time.Now().After(deadline) {
 			e.staged++
@@ -499,36 +529,63 @@ func (wb *WriteBehind) Drain(prefix string, timeout time.Duration) ([]Unresolved
 	}
 }
 
+// lockBy takes m, or gives up at deadline.
+func lockBy(m *sync.Mutex, deadline time.Time) bool {
+	for !m.TryLock() {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return true
+}
+
 func inScope(p, prefix string) bool {
 	return prefix == "" || prefix == "/" || p == prefix || strings.HasPrefix(p, strings.TrimSuffix(prefix, "/")+"/")
 }
 
-// Stop fences writes, queues every file written and not closed, and drains everything within
-// timeout. The SIGTERM path and the control socket's stop both run it.
+// Stop fences writes, queues every file written and not closed, and drains everything, all
+// within one timeout. The SIGTERM path and the control socket's stop both run it.
+//
+// Every change is admitted under the file's dataMutex and registered before it happens (admit,
+// created), and the fence is set under wb.mu with the snapshot. So the snapshot holds every file
+// a change was let into; taking each file's dataMutex waits for a change still running, and any
+// change after the fence is refused with EROFS.
 func (wb *WriteBehind) Stop(timeout time.Duration) ([]Unresolved, bool) {
+	deadline := time.Now().Add(timeout)
 	wb.mu.Lock()
 	wb.fenced = true
-	var open []*FileINode
+	seen := map[*FileINode]bool{}
+	var files []*FileINode
 	for _, e := range wb.entries {
-		if e.state == wbLocal {
-			open = append(open, e.file)
+		if !seen[e.file] {
+			seen[e.file] = true
+			files = append(files, e.file)
 		}
 	}
 	wb.mu.Unlock()
-	logger.Info(fmt.Sprintf("Write-behind stop: writes fenced, %d open files to queue", len(open)), nil)
+	logger.Info(fmt.Sprintf("Write-behind stop: writes fenced, %d files to check", len(files)), nil)
 
-	for _, file := range open {
-		file.lockData()
+	var busy []Unresolved
+	for _, file := range files {
+		if !lockBy(&file.dataMutex, deadline) {
+			busy = append(busy, Unresolved{Path: file.AbsolutePath(), Error: "still being written at the stop deadline"})
+			continue
+		}
 		if file.isDirty {
 			if size, err := file.stagedSize(); err == nil {
-				if _, err := wb.enqueue(file, size); err == nil {
+				if _, err := wb.enqueueBy(file, size, deadline); err == nil {
 					file.isDirty = false
 				}
 			}
 		}
 		file.unlockData()
 	}
-	out, timedOut := wb.Drain("", timeout)
+	out, timedOut := wb.Drain("", time.Until(deadline))
+	if len(busy) > 0 {
+		out, timedOut = append(out, busy...), true
+		sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	}
 	for _, u := range out {
 		logger.Error("Write-behind stop: not on HopsFS", logger.Fields{Operation: Flush, Path: u.Path, Error: u.Error})
 	}
