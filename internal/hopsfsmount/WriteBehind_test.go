@@ -522,3 +522,34 @@ func TestWriteBehindChmodOfAnOpenNewFile(t *testing.T) {
 		assert.Equal(t, "x", e.readRemote("m.txt"))
 	})
 }
+
+// A file over the download-cache limit opens read-only from HopsFS; its first write or truncate
+// loads it, and the upload replaces it as an edit, not as a new file that conflicts.
+func TestWriteBehindFirstChangeOfAnUncachedFile(t *testing.T) {
+	limit := StagingCacheMaxDownloadSize
+	StagingCacheMaxDownloadSize = 4
+	t.Cleanup(func() { StagingCacheMaxDownloadSize = limit })
+	withWriteBehind(t, func(e *wbEnv) {
+		e.writeExternal("w.txt", "0123456789")
+		e.writeExternal("t.txt", "0123456789")
+
+		f, err := os.OpenFile(e.local("w.txt"), os.O_RDWR, 0)
+		require.NoError(t, err)
+		defer f.Close()
+		_, err = f.WriteAt([]byte("AB"), 0)
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+
+		g, err := os.OpenFile(e.local("t.txt"), os.O_RDWR, 0)
+		require.NoError(t, err)
+		defer g.Close()
+		require.NoError(t, g.Truncate(4))
+		require.NoError(t, g.Close())
+
+		assert.Empty(t, e.drain())
+		assert.Equal(t, "AB23456789", e.readRemote("w.txt"))
+		assert.Equal(t, "0123", e.readRemote("t.txt"))
+		assert.Empty(t, e.conflictFiles("w.txt"))
+		assert.Empty(t, e.conflictFiles("t.txt"))
+	})
+}
