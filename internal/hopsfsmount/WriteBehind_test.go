@@ -121,6 +121,8 @@ func (e *wbEnv) conflictFiles(name string) []string {
 }
 
 // hold makes the worker wait at stage of the upload of name until the returned release runs.
+// Callers defer release: a held worker keeps the file's dataMutex, and the unmount at the end of
+// the test would wait for it. release may run more than once.
 func (e *wbEnv) hold(stage, name string) (reached <-chan struct{}, release func()) {
 	target := e.remote(name)
 	at := make(chan struct{})
@@ -134,7 +136,8 @@ func (e *wbEnv) hold(stage, name string) (reached <-chan struct{}, release func(
 			})
 		}
 	}
-	return at, func() { close(gate) }
+	var released sync.Once
+	return at, func() { released.Do(func() { close(gate) }) }
 }
 
 func waitFor(t *testing.T, ch <-chan struct{}) {
@@ -167,6 +170,7 @@ func TestWriteBehindPendingFileIsListedAndReadable(t *testing.T) {
 		// The one worker is held on another file, so p.txt is queued: listed and read from its
 		// staged copy. (A file a worker is uploading waits for that upload, which holds its data lock.)
 		reached, release := e.hold("before-publish", "busy.txt")
+		defer release()
 		e.writeLocal("busy.txt", "b")
 		waitFor(t, reached)
 		e.writeLocal("p.txt", "pending")
@@ -233,6 +237,7 @@ func TestWriteBehindStoppedBeforeRenameLeavesOldVersion(t *testing.T) {
 	withWriteBehind(t, func(e *wbEnv) {
 		e.writeExternal("k.txt", "old")
 		reached, release := e.hold("before-publish", "k.txt")
+		defer release()
 		e.writeLocal("k.txt", "new")
 		waitFor(t, reached)
 		assert.Equal(t, "old", e.readRemote("k.txt"))
@@ -250,6 +255,7 @@ func TestWriteBehindExternalWriteBeforeCheckIsAConflict(t *testing.T) {
 		_, err := os.ReadFile(e.local("x.txt"))
 		require.NoError(t, err)
 		reached, release := e.hold("before-publish", "x.txt")
+		defer release()
 		e.writeLocal("x.txt", "ours")
 		waitFor(t, reached)
 		e.writeExternal("x.txt", "theirs")
@@ -270,6 +276,7 @@ func TestWriteBehindExternalAppendBeforeCheckIsAConflict(t *testing.T) {
 		_, err := os.ReadFile(e.local("ap.txt"))
 		require.NoError(t, err)
 		reached, release := e.hold("before-publish", "ap.txt")
+		defer release()
 		e.writeLocal("ap.txt", "ours")
 		waitFor(t, reached)
 		e.appendExternal("ap.txt", "+X")
@@ -283,6 +290,7 @@ func TestWriteBehindExternalAppendBeforeCheckIsAConflict(t *testing.T) {
 func TestWriteBehindNewFileCreatedExternallyIsAConflict(t *testing.T) {
 	withWriteBehind(t, func(e *wbEnv) {
 		reached, release := e.hold("before-publish", "n.txt")
+		defer release()
 		e.writeLocal("n.txt", "ours")
 		waitFor(t, reached)
 		e.writeExternal("n.txt", "theirs")
@@ -301,6 +309,7 @@ func TestWriteBehindNewFileCreatedExternallyIsAConflict(t *testing.T) {
 func TestWriteBehindExternalAppendNeverAdoptedAsBase(t *testing.T) {
 	withWriteBehind(t, func(e *wbEnv) {
 		reached, release := e.hold("temp-complete", "g.txt")
+		defer release()
 		f, err := os.Create(e.local("g.txt"))
 		require.NoError(t, err)
 		defer f.Close()
@@ -354,6 +363,7 @@ func TestWriteBehindDiscardKeepsHopsFS(t *testing.T) {
 		_, err := os.ReadFile(e.local("d.txt"))
 		require.NoError(t, err)
 		reached, release := e.hold("before-publish", "d.txt")
+		defer release()
 		e.writeLocal("d.txt", "ours")
 		waitFor(t, reached)
 		e.writeExternal("d.txt", "theirs")
@@ -375,6 +385,7 @@ func TestWriteBehindFullQueueFailsCloseWithinItsWait(t *testing.T) {
 		WriteBehindMaxFiles = 1
 		WriteBehindWait = time.Second
 		reached, release := e.hold("before-publish", "q1.txt")
+		defer release()
 		e.writeLocal("q1.txt", "1")
 		waitFor(t, reached)
 		started := time.Now()
@@ -418,6 +429,7 @@ func TestWriteBehindUnlinkOfAFileNeverLanded(t *testing.T) {
 	withWriteBehind(t, func(e *wbEnv) {
 		// The one worker is held on another file, so u.txt is queued and not started.
 		reached, release := e.hold("before-publish", "busy.txt")
+		defer release()
 		e.writeLocal("busy.txt", "b")
 		waitFor(t, reached)
 		e.writeLocal("u.txt", "u")
@@ -475,6 +487,7 @@ func TestWriteBehindStopDuringUploadNeverLosesAnAcceptedWrite(t *testing.T) {
 		_, err = first.WriteString("A")
 		require.NoError(t, err)
 		reached, release := e.hold("before-publish", "w.txt")
+		defer release()
 		require.NoError(t, first.Close()) // queues the upload, which holds the file
 		waitFor(t, reached)
 

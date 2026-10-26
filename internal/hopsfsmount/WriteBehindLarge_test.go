@@ -97,6 +97,7 @@ func TestLargeWriteBehindExternalWriteWhileUploading(t *testing.T) {
 		require.NoError(t, err)
 		size := int64(50) << 20
 		reached, release := e.hold("before-publish", "x.bin")
+		defer release()
 		e.writeLarge("x.bin", 3, size)
 		waitFor(t, reached)
 		e.writeExternal("x.bin", "theirs")
