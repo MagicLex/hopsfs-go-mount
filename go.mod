@@ -49,7 +49,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/colinmarc/hdfs/v2 v2.2.0 => github.com/MagicLex/hopsfs-go-client/v2 v2.6.3-0.20261025171148-6fe213973257
+replace github.com/colinmarc/hdfs/v2 v2.2.0 => github.com/MagicLex/hopsfs-go-client/v2 v2.6.3-0.20261030223005-5f18d94d26a3
 
 //replace github.com/colinmarc/hdfs/v2 v2.2.0 => /home/salman/code/hops/hopsfs-go/hopsfs-go-client
 
